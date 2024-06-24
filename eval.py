@@ -2,12 +2,16 @@
 Evaluate the quality of the LFs, label model, and the final labels.
 """
 import numpy as np
+import wrench.basemodel
+from wrench.endmodel import EndClassifierModel
 from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score, confusion_matrix, roc_auc_score
-from label_model import get_wrench_label_model
 import torch
-from scipy.special import comb
-from sklearn.neighbors import KNeighborsClassifier
+from torchvision import datasets, models, transforms
+import torch.nn as nn
 from snorkel.labeling.analysis import LFAnalysis
+from data_utils import FeaturesDataset
+from torch.utils.data import DataLoader
+from end_model import train_resnet, train_disc_model
 
 
 def evaluate_lfs(labels, L_train, lf_classes=None, n_class=2):
@@ -116,8 +120,13 @@ def evaluate_disc_model(disc_model, test_dataset):
             "auc": np.nan,
             "f1": np.nan
         }
-    y_pred = disc_model.predict(test_dataset.features)
-    y_probs = disc_model.predict_proba(test_dataset.features)
+    if isinstance(disc_model, wrench.basemodel.BaseClassModel):
+        y_pred = disc_model.predict(test_dataset)
+        y_probs = disc_model.predict_proba(test_dataset)
+    else:
+        y_pred = disc_model.predict(test_dataset.features)
+        y_probs = disc_model.predict_proba(test_dataset.features)
+
     test_acc = accuracy_score(test_dataset.labels, y_pred)
     if test_dataset.n_class == 2:
         test_auc = roc_auc_score(test_dataset.labels, y_probs[:, 1])
@@ -133,140 +142,102 @@ def evaluate_disc_model(disc_model, test_dataset):
     }
     return results
 
+def evaluate_resnet(disc_model, test_loader, device):
+    disc_model.eval()
+    all_labels = []
+    all_predictions = []
+    all_probs = []
 
-def calc_lf_score(pos, neg, n_class=2):
-    """
-    Calculate the value for a single LF using majority vote.
-    pos and neg are the number of correct and wrong predictions.
-    """
-    if pos == 0 and neg == 0:
-        return 0, 0
-    if pos == 0:
-        return 0, -1 / (n_class * neg)
-    elif neg == 0:
-        return (n_class - 1) / (n_class * pos), 0
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = disc_model(inputs)
+            _, preds = torch.max(outputs, 1)
+            probs = torch.softmax(outputs, dim=1)[:, 1]
 
-    pos_score = 0
-    for i in range(pos):
-        for j in range(neg + 1):
-            if i + j == 0:
-                score = (n_class - 1) / n_class
-            else:
-                score = ((i + 1) / (i + j + 1) - i / (i + j))
-            pos_score += score * comb(pos - 1, i, exact=True) * comb(neg, j, exact=True) / comb(pos + neg - 1, i + j,
-                                                                                                exact=True)
+            all_labels.extend(labels.cpu().numpy())
+            all_predictions.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
-    pos_score /= pos + neg
-    neg_score = ((pos / (pos + neg)) - 1 / n_class - pos_score * pos) / neg
-    return pos_score, neg_score
+    test_acc = accuracy_score(all_labels, all_predictions)
+    test_auc = roc_auc_score(all_labels, all_probs)
+    test_f1 = f1_score(all_labels, all_predictions)
+    results = {
+        "acc": test_acc,
+        "auc": test_auc,
+        "f1": test_f1
+    }
+    return results
 
 
-def calc_weshap_values(train_dataset, valid_dataset, k=5, distance="euclidean", weights="uniform"):
-    """
-    Calculate the WeShap values for each LF.
-    """
-    L_train = np.array(train_dataset.weak_labels)
-    label_model = get_wrench_label_model("MV")
-    label_model.fit(L_train)
-    y_train_pred = label_model.predict(L_train)
-    # calculate the k neighbors for each validation data point
-    neigh = KNeighborsClassifier(n_neighbors=k, metric=distance, weights=weights)
-    neigh.fit(train_dataset.features, y_train_pred)
-    neigh_dist, neigh_idx = neigh.kneighbors(valid_dataset.features)
-    # calculate the shapley score for each LF
-    vote_count = np.zeros((len(train_dataset), train_dataset.n_class), dtype=int)
-    for c in range(train_dataset.n_class):
-        vote_count[:, c] = np.sum(L_train == c, axis=1)
+def evaluate_golden_baseline(train_dataset, valid_dataset, test_dataset, args):
+    # train an end model use ground truth labels
+    ys = np.array(train_dataset.labels)
+    ys_onehot = np.zeros((len(ys), train_dataset.n_class))
+    ys_onehot[range(len(ys_onehot)), ys] = 1
+    if args.end_model == "bert":
+        device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+        torch.cuda.empty_cache()
+        disc_model = EndClassifierModel(
+            batch_size=32,
+            real_batch_size=16,  # for accumulative gradient update
+            test_batch_size=128,
+            n_steps=1000,
+            backbone='BERT',
+            backbone_model_name='bert-base-cased',
+            backbone_max_tokens=128,
+            backbone_fine_tune_layers=-1,  # fine  tune all
+            optimizer='AdamW',
+            optimizer_lr=5e-5,
+            optimizer_weight_decay=0.0,
+        )
+        disc_model.fit(
+            dataset_train=train_dataset,
+            y_train=ys_onehot,
+            dataset_valid=valid_dataset,
+            evaluation_step=10,
+            metric='acc',
+            patience=10,
+            device=device
+        )
+        test_perf = evaluate_disc_model(disc_model, test_dataset)
 
-    total_vote_count = np.sum(vote_count, axis=1)
-    # record the score for an LF on each training data point
-    lf_scores_pos = np.zeros((len(train_dataset), train_dataset.n_class))
-    lf_scores_neg = np.zeros((len(train_dataset), train_dataset.n_class))
-    lf_score_dict = {}
-    for i in range(len(train_dataset)):
-        for j in range(train_dataset.n_class):
-            pos, neg = vote_count[i, j], total_vote_count[i] - vote_count[i, j]
-            if (pos, neg) not in lf_score_dict:
-                lf_score_dict[(pos, neg)] = calc_lf_score(pos, neg, n_class=train_dataset.n_class)
-            pos_score, neg_score = lf_score_dict[(pos, neg)]
-            lf_scores_pos[i, j] = pos_score
-            lf_scores_neg[i, j] = neg_score
+    elif args.end_model == "resnet-50":
+        # Load the pre-trained ResNet-50 model
+        disc_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
 
-    # calculate the shapley score for each LF
-    lf_shapeley_scores = np.zeros(L_train.shape[1])
-    valid_labels = np.array(valid_dataset.labels)
-    if weights == "uniform":
-        for i in range(len(valid_dataset)):
-            for train_idx in neigh_idx[i]:
-                active_lf_idxs = np.where(L_train[train_idx] != -1)[0]
-                for lf_idx in active_lf_idxs:
-                    if L_train[train_idx, lf_idx] == valid_labels[i]:
-                        lf_shapeley_scores[lf_idx] += lf_scores_pos[train_idx, valid_labels[i]]
-                    else:
-                        lf_shapeley_scores[lf_idx] += lf_scores_neg[train_idx, valid_labels[i]]
+        # Modify the final layer to match the number of classes in your dataset
+        num_classes = train_dataset.n_class  # Change this to the number of classes in your dataset
+        disc_model.fc = nn.Linear(disc_model.fc.in_features, num_classes)
 
-        lf_shapeley_scores /= len(valid_dataset) * k
+        train_dataset_ = FeaturesDataset(train_dataset.images, train_dataset.labels)
+        valid_dataset_ = FeaturesDataset(valid_dataset.images, valid_dataset.labels)
+        test_dataset_ = FeaturesDataset(test_dataset.images, test_dataset.labels)
+        train_loader = DataLoader(train_dataset_, batch_size=64, shuffle=True)
+        valid_loader = DataLoader(valid_dataset_, batch_size=64, shuffle=False)
+        test_loader = DataLoader(test_dataset_, batch_size=64, shuffle=False)
+
+        # Train the resnet-50 model
+        device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
+        torch.cuda.empty_cache()
+        disc_model = train_resnet(disc_model, train_loader, valid_loader,
+                                  n_epochs=50, lr=1e-4, weight_decay=1e-5, device=device)
+        test_perf = evaluate_resnet(disc_model, test_loader, device)
+
     else:
-        eps = 1e-6
-        for i in range(len(valid_dataset)):
-            weight_sum = np.sum(1 / (neigh_dist[i]+eps))
-            for train_idx, dist in zip(neigh_idx[i], neigh_dist[i]):
-                active_lf_idxs = np.where(L_train[train_idx] != -1)[0]
-                weight = 1 / (dist+eps) / weight_sum
-                for lf_idx in active_lf_idxs:
-                    if L_train[train_idx, lf_idx] == valid_labels[i]:
-                        lf_shapeley_scores[lf_idx] += lf_scores_pos[train_idx, valid_labels[i]] * weight
-                    else:
-                        lf_shapeley_scores[lf_idx] += lf_scores_neg[train_idx, valid_labels[i]] * weight
+        disc_model = train_disc_model(model_type=args.end_model,
+                                      distance_metric=args.distance_metric,
+                                      xs_tr=train_dataset.features,
+                                      ys_tr_soft=ys_onehot,
+                                      valid_dataset=valid_dataset,
+                                      use_soft_labels=args.use_soft_labels,
+                                      tune_end_model=args.tune_end_model,
+                                      tune_metric=args.tune_metric)
+        test_perf = evaluate_disc_model(disc_model, test_dataset)
 
-        lf_shapeley_scores /= len(valid_dataset)
+    return test_perf
 
-    return lf_shapeley_scores
-
-
-def approximate_label_model(L_aug, Y):
-    # Convert NumPy arrays to PyTorch tensors
-    L_aug = L_aug.reshape(len(L_aug), -1)
-    L = torch.tensor(L_aug, dtype=torch.float32)
-    Y = torch.tensor(Y, dtype=torch.float32)
-
-    # Initialize W as a PyTorch tensor with requires_grad=True for optimization
-    M, C = L.shape[1], Y.shape[1]
-    W = torch.randn(M, C, requires_grad=True)
-
-    # Define the optimizer
-    optimizer = torch.optim.Adam([W], lr=0.01)
-
-    # Number of iterations for the optimization loop
-    num_epochs = 10000
-
-    # Optimization loop with tqdm progress bar
-    for epoch in range(num_epochs):
-        optimizer.zero_grad()
-
-        # Compute L @ W
-        LW = torch.matmul(L, W)
-
-        # Normalize each row of LW to sum to 1
-        row_sums = LW.sum(dim=1, keepdim=True)
-        normalized_LW = LW / row_sums
-
-        # Compute the objective function (loss)
-        loss = torch.norm(normalized_LW - Y)
-
-        # Backpropagation
-        loss.backward()
-
-        # Print the loss every 100 epochs
-        if epoch % 500 == 0:
-            print(f'Epoch {epoch}, Loss: {loss.item()}')
-
-        # Update the weights
-        optimizer.step()
-
-    # Final optimized W
-    W_optimized = W.detach().numpy().reshape(-1, C + 1, C)
-    return W_optimized
 
 
 

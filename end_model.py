@@ -7,6 +7,26 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.base import BaseEstimator, ClassifierMixin
 import optuna
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+import copy
+
+
+def random_argmax(arr):
+    # Apply random_argmax to each row in the array
+    def random_choice_of_max(arr):
+        # Find the maximum value
+        max_val = np.max(arr)
+
+        # Find all indices where the array is equal to the maximum value
+        max_indices = np.where(arr == max_val)[0]
+
+        # Randomly select one of these indices
+        return np.random.choice(max_indices)
+
+    return np.apply_along_axis(random_choice_of_max, 1, arr)
 
 
 def get_discriminator(model_type, use_soft_labels, n_class=2, **params):
@@ -17,7 +37,7 @@ def get_discriminator(model_type, use_soft_labels, n_class=2, **params):
     elif model_type == "mlp":
         return MLP(use_soft_labels, n_class=n_class, **params)
     else:
-        raise ValueError('discriminator model not supported.')
+        raise ValueError('discriminator disc_model not supported.')
 
 
 def train_disc_model(model_type, distance_metric, xs_tr, ys_tr_soft, valid_dataset, use_soft_labels, tune_end_model, tune_metric):
@@ -42,19 +62,58 @@ def train_disc_model(model_type, distance_metric, xs_tr, ys_tr_soft, valid_datas
     return disc_model
 
 
-def random_argmax(arr):
-    # Apply random_argmax to each row in the array
-    def random_choice_of_max(arr):
-        # Find the maximum value
-        max_val = np.max(arr)
+def train_resnet(model, train_loader, valid_loader, n_epochs, lr, weight_decay, device):
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = StepLR(optimizer, step_size=7, gamma=0.1)
 
-        # Find all indices where the array is equal to the maximum value
-        max_indices = np.where(arr == max_val)[0]
+    best_valid_loss = float('inf')
+    best_model = None
+    patience = 5
+    early_stopping_counter = 0
 
-        # Randomly select one of these indices
-        return np.random.choice(max_indices)
+    for epoch in range(n_epochs):
+        model.train()
+        train_loss = 0.0
+        for X, y in train_loader:
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            y_pred = model(X)
+            loss = criterion(y_pred, y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
 
-    return np.apply_along_axis(random_choice_of_max, 1, arr)
+        model.eval()
+        valid_loss = 0.0
+        with torch.no_grad():
+            for X, y in valid_loader:
+                X, y = X.to(device), y.to(device)
+                y_pred = model(X)
+                loss = criterion(y_pred, y)
+                valid_loss += loss.item()
+
+        scheduler.step()
+
+        train_loss /= len(train_loader)
+        valid_loss /= len(valid_loader)
+
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            best_model = copy.deepcopy(model.state_dict())
+            early_stopping_counter = 0
+        else:
+            early_stopping_counter += 1
+
+        if early_stopping_counter >= patience:
+            print("Early stopping")
+            break
+
+        print(f"Epoch {epoch + 1}/{n_epochs}, Train Loss: {train_loss:.4f}, Valid Loss: {valid_loss:.4f}")
+
+    model.load_state_dict(best_model)
+    return model
 
 
 class EndClassifier:
@@ -134,7 +193,7 @@ class SoftLabelLogRegClassifier(BaseEstimator, ClassifierMixin):
         y_expanded = y_expanded[positive_weight_idx]
         sample_weight = sample_weight[positive_weight_idx]
 
-        # Train the model using the expanded dataset and sample weights
+        # Train the disc_model using the expanded dataset and sample weights
         self.y_unique = np.unique(y_expanded)
         if len(self.y_unique) == 1:
             warnings.warn("All labels are the same, no need to train a discriminator.")

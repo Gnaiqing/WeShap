@@ -1,110 +1,65 @@
 import re
 import numpy as np
-import html
-import nltk
-from nltk.util import ngrams
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize, sent_tokenize
-from nltk.stem import PorterStemmer, SnowballStemmer
 from wrench.dataset import load_dataset, BaseDataset
 from sentence_transformers import SentenceTransformer
 from sklearn import preprocessing
 from transformers import AutoModel, AutoTokenizer, AutoModelForSequenceClassification
+from torch.utils.data import Dataset
 import pdb
 import torch
 from pathlib import Path
 import os
 import json
+from torchvision import datasets, models, transforms
+from torch.utils.data import DataLoader
+from PIL import Image
 
-
-def preprocess_text(text, stop_words=None, stemming="porter"):
-    if stop_words is not None:
-        stop_words = set(stopwords.words(stop_words))
-    else:
-        stop_words = set()
-
-    if stemming == "porter":
-        stemmer = PorterStemmer()
-    elif stemming == "snowball":
-        stemmer = SnowballStemmer(language="english")
-    else:
-        stemmer = None
-
-    processed_tokens = []
-    tokens = nltk.word_tokenize(text.lower())
-    for token in tokens:
-        # filter out stopwords and non-words
-        if token in stop_words or (re.search("^\w+$", token) is None):
-            continue
-        if stemmer is not None:
-            token = stemmer.stem(token)
-
-        processed_tokens.append(token)
-
-    processed_text = " ".join(processed_tokens)
-    return processed_text
-
-
-def build_revert_index(dataset, stop_words=None, stemming="porter", max_ngram=1, cache_path=None):
+def preprocess_image_dataset(dataset, image_root):
     """
-    Build reverted index for the given text dataset
+    Preprocess an image dataset in wrench format, extract raw features from image paths and store them in numpy array
     """
-    if cache_path is not None:
-        if os.path.exists(cache_path):
-            with open(cache_path) as infile:
-                reverted_index = json.load(infile)
-                for phrase in reverted_index:
-                    reverted_index[phrase] = np.array(reverted_index[phrase])
+    # Define the image transformations (as required by ResNet-50)
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-                return reverted_index
+    def preprocess_image(image_path):
+        """Load an image, preprocess it, and extract features."""
+        image = Image.open(image_path).convert('RGB')
+        image = preprocess(image)
+        image = image.unsqueeze(0)  # Add a batch dimension
+        return image
 
-    # preprocess data
-    corpus = [dataset.examples[idx]["text"] for idx in range(len(dataset))]
-    if stop_words is not None:
-        stop_words = set(stopwords.words(stop_words))
-    else:
-        stop_words = set()
+    image_list = []
+    for i in range(len(dataset)):
+        image_name = dataset.examples[i]["image"]
+        image_path = Path(image_root) / image_name
+        image = preprocess_image(image_path)
+        image_list.append(image)
 
-    if stemming == "porter":
-        stemmer = PorterStemmer()
-    elif stemming == "snowball":
-        stemmer = SnowballStemmer(language="english")
-    else:
-        stemmer = None
+    image_feature = np.concatenate(image_list, axis=0)
+    return image_feature
 
-    reverted_index = {}
+class FeaturesDataset(Dataset):
+    def __init__(self, features, labels):
+        """
+        Args:
+            features (numpy array or torch tensor): The input features.
+            labels (numpy array or torch tensor): The labels.
+        """
+        self.features = torch.tensor(features, dtype=torch.float32) if isinstance(features, np.ndarray) else features
+        self.labels = torch.tensor(labels, dtype=torch.long) if isinstance(labels, np.ndarray) else labels
 
-    for idx, text in enumerate(corpus):
-        processed_tokens = []
-        text = re.sub("\ufeff", "", text)
-        tokens = nltk.word_tokenize(text.lower())
-        for token in tokens:
-            # filter out stopwords and non-words
-            if token in stop_words or (re.search("^\w+$", token) is None):
-                continue
-            if stemmer is not None:
-                token = stemmer.stem(token)
+    def __len__(self):
+        """Returns the total number of samples."""
+        return len(self.features)
 
-            processed_tokens.append(token)
-
-        for n in range(max_ngram):
-            phrases = ngrams(processed_tokens, n+1)
-            for t in phrases:
-                phrase = " ".join(t)
-                if phrase in reverted_index:
-                    if reverted_index[phrase][-1] != idx:
-                        reverted_index[phrase].append(idx)
-                else:
-                    reverted_index[phrase] = [idx]
-
-    if cache_path is not None:
-        with open(cache_path, "w") as outfile:
-            json.dump(reverted_index, outfile)
-
-    for phrase in reverted_index:
-        reverted_index[phrase] = np.array(reverted_index[phrase])
-
-    return reverted_index
+    def __getitem__(self, idx):
+        """Generates one sample of data."""
+        return self.features[idx], self.labels[idx]
 
 
 def extract_features(sentences, tokenizer, model, batch_size=32):
@@ -118,11 +73,11 @@ def extract_features(sentences, tokenizer, model, batch_size=32):
         # Prepare batch inputs
         batch_input = {k: v[i:i + batch_size] for k, v in encoded_input.items()}
 
-        # Move batch to the same device as model
+        # Move batch to the same device as disc_model
         batch_input = {k: v.to(model.device) for k, v in batch_input.items()}
 
         with torch.no_grad():
-            # Get model outputs for the current batch
+            # Get disc_model outputs for the current batch
             outputs = model(**batch_input, output_hidden_states=True)
             hidden_states = outputs.hidden_states
 
@@ -137,8 +92,7 @@ def extract_features(sentences, tokenizer, model, batch_size=32):
     return sentence_embeddings
 
 
-def load_wrench_data(data_root, dataset_name, feature, stopwords=None, stemming="porter", max_ngram=1,
-                     scalar=None, revert_index=False):
+def load_wrench_data(data_root, dataset_name, feature, image_root=None):
     if feature == "bert":
         train_dataset, valid_dataset, test_dataset = load_dataset(data_root, dataset_name,
                                                                   extract_feature=True, extract_fn="bert", cache_name="bert")
@@ -147,9 +101,9 @@ def load_wrench_data(data_root, dataset_name, feature, stopwords=None, stemming=
         cache_path = Path(data_root) / dataset_name / "sentence_bert_cache"
         if not os.path.exists(cache_path):
             os.makedirs(cache_path)
-        train_cache_path = cache_path / "train_features.pkl.npy"
-        valid_cache_path = cache_path / "valid_features.pkl.npy"
-        test_cache_path = cache_path / "test_features.pkl.npy"
+        train_cache_path = cache_path / "train_features.npy"
+        valid_cache_path = cache_path / "valid_features.npy"
+        test_cache_path = cache_path / "test_features.npy"
 
         if os.path.exists(train_cache_path):
             train_dataset.features = np.load(train_cache_path, allow_pickle=True)
@@ -198,22 +152,12 @@ def load_wrench_data(data_root, dataset_name, feature, stopwords=None, stemming=
         train_dataset, valid_dataset, test_dataset = load_dataset(data_root, dataset_name,
                                                                   extract_feature=True, extract_fn=feature)
 
-    if scalar is not None:
-        if scalar == "standard":
-            scalar = preprocessing.StandardScaler().fit(train_dataset.features)
-            train_dataset.features = scalar.transform(train_dataset.features)
-            valid_dataset.features = scalar.transform(valid_dataset.features)
-            test_dataset.features = scalar.transform(test_dataset.features)
-
-    if revert_index:
-        train_cache_path = Path(data_root) / dataset_name / "train_index.json"
-        valid_cache_path = Path(data_root) / dataset_name / "valid_index.json"
-        test_cache_path = Path(data_root) / dataset_name / "test_index.json"
-        train_dataset.revert_index = build_revert_index(train_dataset, stop_words=stopwords, stemming=stemming,
-                                                        max_ngram=max_ngram, cache_path=train_cache_path)
-        valid_dataset.revert_index = build_revert_index(valid_dataset, stop_words=stopwords, stemming=stemming,
-                                                        max_ngram=max_ngram, cache_path=valid_cache_path)
-        test_dataset.revert_index = build_revert_index(test_dataset, stop_words=stopwords, stemming=stemming,
-                                                       max_ngram=max_ngram, cache_path=test_cache_path)
+    if dataset_name in ["indoor-outdoor", "voc07-animal"]:
+        train_raw = preprocess_image_dataset(train_dataset, image_root)
+        valid_raw = preprocess_image_dataset(valid_dataset, image_root)
+        test_raw = preprocess_image_dataset(test_dataset, image_root)
+        train_dataset.images = train_raw
+        valid_dataset.images = valid_raw
+        test_dataset.images = test_raw
 
     return train_dataset, valid_dataset, test_dataset

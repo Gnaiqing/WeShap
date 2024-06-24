@@ -6,22 +6,24 @@ from data_utils import load_wrench_data
 from utils import print_dataset_stats
 import numpy as np
 import os
-from utils import run_pws_pipeline, get_lf_orders, load_lf_names, plot_pca, filter_unhelpful_lfs, \
-    mute_unhelpful_weak_labels, compute_if_score, approximate_label_model, tune_if_revision, tune_proxy_model_params
+from utils import run_pws_pipeline, get_lf_orders, load_lf_names, filter_unhelpful_lfs, \
+    mute_unhelpful_weak_labels, compute_if_score, run_if_revision, tune_proxy_model_params
 import wandb
 from pathlib import Path
-from end_model import KNN, train_disc_model
-from eval import evaluate_disc_model, evaluate_lfs, evaluate_labels
+from eval import evaluate_golden_baseline
 from snorkel.labeling.analysis import LFAnalysis
 from weshap import WeShapAnalysis
 import warnings
+
 warnings.filterwarnings("ignore")
 
 def main(args):
     train_dataset, valid_dataset, test_dataset = load_wrench_data(data_root=args.dataset_path,
                                                                   dataset_name=args.dataset_name,
-                                                                  feature=args.feature_extractor)
+                                                                  feature=args.feature_extractor,
+                                                                  image_root=args.image_root)
 
+    # sample validation set for evaluating WeShap and other metrics
     if args.valid_sample_frac < 1.0:
         sampled_valid_ids = np.random.choice(len(valid_dataset.ids), int(len(valid_dataset.ids) * args.valid_sample_frac),
                                             replace=False)
@@ -37,38 +39,6 @@ def main(args):
     print_dataset_stats(train_dataset, split="train")
     print_dataset_stats(valid_dataset, split="valid")
     print_dataset_stats(test_dataset, split="test")
-
-    # train an end model use ground truth labels
-    ys = np.array(train_dataset.labels)
-    ys_onehot = np.zeros((len(ys), train_dataset.n_class))
-    ys_onehot[range(len(ys_onehot)), ys] = 1
-    disc_model = train_disc_model(model_type=args.end_model,
-                                  distance_metric=args.distance_metric,
-                                  xs_tr=train_dataset.features,
-                                  ys_tr_soft=ys_onehot,
-                                  valid_dataset=valid_dataset,
-                                  use_soft_labels=args.use_soft_labels,
-                                  tune_end_model=args.tune_end_model,
-                                  tune_metric=args.tune_metric)
-    golden_test_perf = evaluate_disc_model(disc_model, test_dataset)
-    # train an end model using validation dataset
-    ys = np.array(valid_dataset.labels)
-    ys_onehot = np.zeros((len(ys), valid_dataset.n_class))
-    ys_onehot[range(len(ys_onehot)), ys] = 1
-    disc_model_valid = train_disc_model(model_type=args.end_model,
-                                        distance_metric=args.distance_metric,
-                                        xs_tr=valid_dataset.features,
-                                        ys_tr_soft=ys_onehot,
-                                        valid_dataset=valid_dataset,
-                                        use_soft_labels=args.use_soft_labels,
-                                        tune_end_model=args.tune_end_model,
-                                        tune_metric=args.tune_metric)
-    valid_test_perf = evaluate_disc_model(disc_model_valid, test_dataset)
-
-    if args.plot_pca:
-        title = f"{args.dataset_name}-{args.feature_extractor}-PCA"
-        save_path = Path(args.dataset_path) / args.dataset_name / f"pca_{args.dataset_name}_{args.feature_extractor}.png"
-        plot_pca(train_dataset, title, save_path)
 
     if args.save_wandb:
         group_id = wandb.util.generate_id()
@@ -107,7 +77,7 @@ def main(args):
         "tune_metric": args.tune_metric,
         "abstain_strategy": args.abstain_strategy,
         "distance_metric": args.distance_metric,
-        "use_soft_labels": args.use_soft_labels
+        "use_soft_labels": args.use_soft_labels,
     }
     if args.tune_weshap_params:
         weshap_params = tune_proxy_model_params(sampled_valid_dataset, tune_metric="acc")
@@ -132,18 +102,12 @@ def main(args):
                 wandb.define_metric("test_acc", summary="mean")
                 wandb.define_metric("test_f1", summary="mean")
                 wandb.define_metric("test_auc", summary="mean")
-                wandb.run.summary["golden_test_acc"] = golden_test_perf["acc"]
-                wandb.run.summary["golden_test_f1"] = golden_test_perf["f1"]
-                wandb.run.summary["golden_test_auc"] = golden_test_perf["auc"]
-                wandb.run.summary["valid_test_acc"] = valid_test_perf["acc"]
-                wandb.run.summary["valid_test_f1"] = valid_test_perf["f1"]
-                wandb.run.summary["valid_test_auc"] = valid_test_perf["auc"]
 
             train_dataset.weak_labels = L_train.tolist()
             valid_dataset.weak_labels = L_valid.tolist()
             n_lf = L_train.shape[1]
             lf_nums = list(range(args.interval, n_lf, args.interval))
-            if lf_nums[-1] != n_lf:
+            if len(lf_nums) == 0 or lf_nums[-1] != n_lf:
                 lf_nums.append(n_lf)
 
             # rank LFs
@@ -153,7 +117,7 @@ def main(args):
                 train_dataset.weak_labels = L_train[:, lf_order[:lf_num]].tolist()
                 valid_dataset.weak_labels = L_valid[:, lf_order[:lf_num]].tolist()
                 lf_stats, label_stats, test_perf = run_pws_pipeline(train_dataset, valid_dataset, test_dataset,
-                                                                    **pws_configs)
+                                                                    **pws_configs, device=args.device)
                 print(f"LF num: {lf_num}, Test perf: {test_perf}")
 
                 if args.save_wandb:
@@ -180,12 +144,6 @@ def main(args):
                     project="LLMDP-eval",
                     config=config_dict
                 )
-                wandb.run.summary["golden_test_acc"] = golden_test_perf["acc"]
-                wandb.run.summary["golden_test_f1"] = golden_test_perf["f1"]
-                wandb.run.summary["golden_test_auc"] = golden_test_perf["auc"]
-                wandb.run.summary["valid_test_acc"] = valid_test_perf["acc"]
-                wandb.run.summary["valid_test_f1"] = valid_test_perf["f1"]
-                wandb.run.summary["valid_test_auc"] = valid_test_perf["auc"]
 
             # run the original pipeline
             train_dataset.weak_labels = L_train.tolist()
@@ -193,13 +151,14 @@ def main(args):
             train_dataset.n_lf = len(train_dataset.weak_labels[0])
             valid_dataset.n_lf = len(valid_dataset.weak_labels[0])
             origin_lf_stats, origin_label_stats, origin_test_perf = run_pws_pipeline(
-                train_dataset, valid_dataset, test_dataset, **pws_configs)
+                train_dataset, valid_dataset, test_dataset, **pws_configs, device=args.device)
             print(f"Original Test perf: {origin_test_perf}")
             if args.revision_type in ["filter", "filter+mute"]:
                 print(f"Filter LFs based on {args.eval_metric}")
                 # filter unhelpful LFs
                 lf_order, lf_values = get_lf_orders(args, train_dataset, sampled_valid_dataset, rng, weshap_params)
-                selected_lfs = filter_unhelpful_lfs(train_dataset, sampled_valid_dataset, lf_order, pws_configs)
+                selected_lfs, threshold = filter_unhelpful_lfs(train_dataset, sampled_valid_dataset, lf_values,
+                                                               pws_configs, tune_threshold=args.tune_revision_threshold)
                 train_dataset.weak_labels = L_train[:, selected_lfs].tolist()
                 valid_dataset.weak_labels = L_valid[:, selected_lfs].tolist()
                 train_dataset.n_lf = len(train_dataset.weak_labels[0])
@@ -212,7 +171,9 @@ def main(args):
                                               weights=weshap_params["weights"],
                                               metric=weshap_params["distance_metric"])
                     weshap_contributions = analysis.calculate_contribution()
-                    L_train_mute = mute_unhelpful_weak_labels(train_dataset, sampled_valid_dataset, weshap_contributions, pws_configs)
+                    L_train_mute, threshold = mute_unhelpful_weak_labels(train_dataset, sampled_valid_dataset,
+                                                                         weshap_contributions, pws_configs,
+                                                                         tune_threshold=args.tune_revision_threshold)
                     train_dataset.weak_labels = L_train_mute.tolist()
 
                 elif args.eval_metric == "if":
@@ -226,19 +187,9 @@ def main(args):
                     else:
                         if_score = None
 
-                    modified_soft_labels, disc_model = tune_if_revision(train_dataset, valid_dataset, args.if_type, args.if_mode, pws_configs,
-                                                                        tune_metric=args.tune_metric, if_score=if_score)
-                    cur_L_train = np.array(train_dataset.weak_labels)
-                    train_labels = np.array(train_dataset.labels)
-                    revised_lf_stats = evaluate_lfs(train_labels, cur_L_train, n_class=train_dataset.n_class)
-                    ys_tr = np.repeat(-1, len(train_labels))
-                    covered_train_indices = np.max(cur_L_train, axis=1) >= 0
-                    ys_tr[covered_train_indices] = np.argmax(modified_soft_labels, axis=1)
-                    revised_label_stats = evaluate_labels(train_labels, ys_tr, n_class=train_dataset.n_class)
-                    if disc_model is not None:
-                        revised_test_perf = evaluate_disc_model(disc_model, test_dataset)
-                    else:
-                        revised_test_perf = {"acc": np.nan, "f1": np.nan, "auc": np.nan}
+                    revised_lf_stats, revised_label_stats, revised_test_perf, threshold = run_if_revision(
+                        train_dataset, valid_dataset, test_dataset, args.if_type, args.if_mode, pws_configs,
+                        tune_threshold=args.tune_revision_threshold, if_score=if_score, device=args.device)
 
                 else:
                     raise ValueError(f"Invalid eval_metric: {args.eval_metric} for weak label revision")
@@ -246,7 +197,7 @@ def main(args):
             # run the revised pipeline
             if not (args.eval_metric == "if" and args.revision_type in ["mute","filter+mute"]):
                 revised_lf_stats, revised_label_stats, revised_test_perf = run_pws_pipeline(
-                    train_dataset, valid_dataset, test_dataset, **pws_configs)
+                    train_dataset, valid_dataset, test_dataset, **pws_configs, device=args.device)
 
             print(f"Revised Test perf: {revised_test_perf}")
             if args.save_wandb:
@@ -261,6 +212,7 @@ def main(args):
                     "origin_test_acc": origin_test_perf["acc"],
                     "origin_test_f1": origin_test_perf["f1"],
                     "origin_test_auc": origin_test_perf["auc"],
+                    "revision_threshold": threshold,
                     "revised_lf_num": len(train_dataset.weak_labels[0]),
                     "revised_lf_acc_avg": revised_lf_stats["lf_acc_avg"],
                     "revised_lf_cov_avg": revised_lf_stats["lf_cov_avg"],
@@ -273,21 +225,40 @@ def main(args):
                     "revised_test_auc": revised_test_perf["auc"],
                 })
                 wandb.finish()
+
+    else:
+        for run in range(args.runs):
+            if args.save_wandb:
+                wandb.init(
+                    project="LLMDP-eval",
+                    config=config_dict
+                )
+            # run the original pipeline
+            test_perf = evaluate_golden_baseline(train_dataset, valid_dataset, test_dataset, args)
+            if args.save_wandb:
+                wandb.log({
+                    "test_acc": test_perf["acc"],
+                    "test_f1": test_perf["f1"],
+                    "test_auc": test_perf["auc"],
+                })
+                wandb.finish()
+
                 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # Usage of WeShap
-    parser.add_argument("--mode", type=str, default="rank", choices=["rank", "revise"], help="Use Mode")
+    parser.add_argument("--mode", type=str, default="rank", choices=["rank", "revise", "golden"], help="Use Mode")
     parser.add_argument("--revision-type", type=str, default="mute", choices=["filter", "mute", "filter+mute"])
     # dataset
-    parser.add_argument("--dataset-path", type=str, default="./data/wrench_data", help="dataset path")
+    parser.add_argument("--dataset-path", type=str, default="./data", help="dataset path")
     parser.add_argument("--dataset-name", type=str, default="youtube", help="dataset name")
+    parser.add_argument("--image-root", type=str, default="../companion/ch03_creating_datasets/cv/data/")
     parser.add_argument("--feature-extractor", type=str, default="bert", help="feature for training end model")
     # label functions
     parser.add_argument("--lf-tag", type=str, default=None, help="tag of LF to use. If None, use original LFs")
     # label function selection
-    parser.add_argument("--eval-metric", type=str, default="random",
+    parser.add_argument("--eval-metric", type=str, default="weshap",
                         choices=["random", "if", "weshap", "acc", "cov", "acc-cov"], help="metric used to evaluate LFs")
     # weshap settings
     parser.add_argument("--feature-transform", type=str, default="none", choices=["none", "pca", "lda"], help="feature transform method")
@@ -296,6 +267,7 @@ if __name__ == '__main__':
     parser.add_argument("--weshap-k", type=int, default=10, help="k for WEShap")
     parser.add_argument("--weshap-weights", type=str, default="uniform", choices=["uniform", "distance"], help="weight for WEShap")
     parser.add_argument("--tune-weshap-params", action="store_true", help="set to true if tune WEShap hyperparameters")
+    parser.add_argument("--tune-revision-threshold", action="store_true", help="set to true if tune revision threshold")
     # influence function settings
     parser.add_argument("--if-type", type=str, default="if", choices=["if", "sif", "relatif"], help="type of IF")
     parser.add_argument("--if-mode", type=str, default="RW", choices=["RW", "WM", "normal"], help="mode of IF")
@@ -304,7 +276,7 @@ if __name__ == '__main__':
     # data programming
     parser.add_argument("--label-model", type=str, default="Snorkel", choices=["Snorkel", "MV"], help="label model used in DP paradigm")
     parser.add_argument("--use-soft-labels", action="store_true", help="set to true if use soft labels when training end model")
-    parser.add_argument("--end-model", type=str, default="logistic", choices=["logistic", "mlp", "knn"], help="end model in DP paradigm")
+    parser.add_argument("--end-model", type=str, default="logistic", choices=["logistic", "mlp", "knn", "bert", "resnet-50"], help="end model in DP paradigm")
     parser.add_argument("--distance-metric", type=str, default="euclidean", choices=["cosine", "euclidean", "manhatten"], help="distance metric for KNN")
     parser.add_argument("--abstain-strategy", type=str, default="discard", choices=["discard", "keep", "random"], help="strategy for abstained data")
     parser.add_argument("--tune-label-model", action="store_true", help="tune label model hyperparameters")
@@ -315,8 +287,8 @@ if __name__ == '__main__':
     parser.add_argument("--valid-sample-frac", type=float, default=1.0, help="validation size")
     parser.add_argument("--interval", type=int, default=10, help="interval of LF number for evaluating LF ranking")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cuda:0", help="device for training")
     parser.add_argument("--save-wandb", action="store_true", help="save results to wandb")
-    parser.add_argument("--plot-pca", action="store_true", help="plot PCA")
     args = parser.parse_args()
     main(args)
 

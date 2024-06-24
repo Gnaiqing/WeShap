@@ -13,7 +13,7 @@ class WeShapAnalysis:
         n_class = train_dataset.n_class
         self.L_train = np.array(train_dataset.weak_labels)
         n, m = self.L_train.shape
-        # train a KNN model
+        # train a KNN model to find the neighbors of each instance in the validation set
         KNN = KNeighborsClassifier(n_neighbors=n_neighbors, weights=weights, metric=metric)
         label_model = get_wrench_label_model("MV")
         label_model.fit(self.L_train)

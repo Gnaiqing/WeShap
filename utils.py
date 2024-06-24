@@ -1,17 +1,20 @@
 import numpy as np
 from label_model import get_wrench_label_model
-from end_model import train_disc_model
+from end_model import train_disc_model, random_argmax, train_resnet
 from wrench.search import grid_search
 from wrench.search_space import SEARCH_SPACE
 from wrench.explainer import Explainer, modify_training_labels
+from wrench.endmodel import EndClassifierModel
 from snorkel.labeling.analysis import LFAnalysis
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.decomposition import PCA
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import accuracy_score
 import torch
+import torch.optim as optim
+import torch.nn as nn
 import copy
-from eval import evaluate_lfs,evaluate_labels,evaluate_disc_model
+from eval import evaluate_lfs,evaluate_labels,evaluate_disc_model, evaluate_resnet
 from weshap import WeShapAnalysis
 import optuna
 from pathlib import Path
@@ -20,27 +23,11 @@ import json
 from scipy.optimize import least_squares
 from scipy.sparse import csr_matrix
 import matplotlib.pyplot as plt
+from data_utils import FeaturesDataset
 import wandb
-
-
-def plot_pca(train_dataset, title, save_path):
-    ### plot PCA for train dataset
-    pca = PCA(n_components=2)
-    pca.fit(train_dataset.features)
-    X = pca.transform(train_dataset.features)
-    y = np.array(train_dataset.labels)
-    if len(X) > 1000:
-        rng = np.random.default_rng(0)
-        selected_indices = rng.choice(len(X), 1000, replace=False)
-        X = X[selected_indices]
-        y = y[selected_indices]
-
-    plt.figure()
-    plt.scatter(X[:, 0], X[:, 1], c=y, marker=".", cmap='rainbow')
-    plt.title(title)
-    plt.savefig(save_path)
-    plt.close()
-
+from torchvision import datasets, models, transforms
+from torch.utils.data import DataLoader
+from PIL import Image
 
 def plot_correction(weshap_correction, if_correction, n_error, title, save_path):
     plt.figure()
@@ -60,72 +47,104 @@ def plot_correction(weshap_correction, if_correction, n_error, title, save_path)
     plt.close()
 
 
-def filter_unhelpful_lfs(train_dataset, valid_dataset, lf_order, pws_configs, tune_metric="acc"):
-    L_train = np.array(train_dataset.weak_labels)
-    L_valid = np.array(valid_dataset.weak_labels)
-    train_dataset = copy.copy(train_dataset)
-    valid_dataset = copy.copy(valid_dataset)
-    pws_configs = copy.copy(pws_configs)
-    pws_configs["tune_label_model"] = False
-    pws_configs["tune_end_model"] = False
-    n_lf = L_train.shape[1]
-    def objective(trial):
-        params = {"selected_lf_num": trial.suggest_int("selected_lf_num", 3, n_lf)}
-        selected_lf = lf_order[:params["selected_lf_num"]]
-        train_dataset.weak_labels = L_train[:, selected_lf].tolist()
-        valid_dataset.weak_labels = L_valid[:, selected_lf].tolist()
-        try:
-            lf_stats, label_stats, test_perf = run_pws_pipeline(train_dataset, valid_dataset, valid_dataset, **pws_configs)
-        except ValueError:
-            return -1
+def filter_unhelpful_lfs(train_dataset, valid_dataset, lf_values, pws_configs, tune_threshold=True):
+    lf_order = np.argsort(lf_values)[::-1]
+    if tune_threshold:
+        L_train = np.array(train_dataset.weak_labels)
+        L_valid = np.array(valid_dataset.weak_labels)
+        train_dataset = copy.copy(train_dataset)
+        valid_dataset = copy.copy(valid_dataset)
+        pws_configs = copy.copy(pws_configs)
+        pws_configs["tune_label_model"] = False
+        pws_configs["tune_end_model"] = False
+        if pws_configs["end_model"] in ["bert", "resnet-50"]:
+            # Use fixed feature expression instead of tuning the whole end model
+            pws_configs["end_model"] = "logistic"
 
-        if tune_metric == "acc":
+        n_lf = L_train.shape[1]
+        def objective(trial):
+            params = {"selected_lf_num": trial.suggest_int("selected_lf_num", 3, n_lf)}
+            selected_lf = lf_order[:params["selected_lf_num"]]
+            active_indices = np.max(L_train, axis=1) != -1
+            train_dataset.weak_labels = L_train[:, selected_lf].tolist()
+            valid_dataset.weak_labels = L_valid[:, selected_lf].tolist()
+            revised_active_indices = np.max(L_train[:, selected_lf], axis=1) != -1
+            if np.sum(revised_active_indices) < 0.1 * np.sum(active_indices):
+                # the number of active instances is too small
+                return -1
+
+            try:
+                lf_stats, label_stats, test_perf = run_pws_pipeline(train_dataset, valid_dataset, valid_dataset, **pws_configs)
+            except ValueError:
+                return -1
+
+            if np.isnan(test_perf["acc"]):
+                return -1
+
             return test_perf["acc"]
-        elif tune_metric == "f1":
-            return test_perf["f1"]
-        elif tune_metric == "auc":
-            return test_perf["auc"]
-        else:
-            raise NotImplementedError
 
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=20)
-    return lf_order[:study.best_params["selected_lf_num"]]
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=20)
+        last_lf = lf_order[study.best_params["selected_lf_num"]-1]
+        threshold = lf_values[last_lf]
+        return lf_order[:study.best_params["selected_lf_num"]], threshold
+    else:
+        threshold = 0.0
+        lf_size = np.sum(lf_values >= threshold)
+        return lf_order[:lf_size], threshold
 
 
-def mute_unhelpful_weak_labels(train_dataset, valid_dataset, contribution_matrix, pws_configs, tune_metric="acc"):
+def mute_unhelpful_weak_labels(train_dataset, valid_dataset, contribution_matrix, pws_configs, tune_threshold=True):
     L_train = np.array(train_dataset.weak_labels)
-    train_dataset = copy.copy(train_dataset)
-    pws_configs = copy.copy(pws_configs)
-    pws_configs["tune_label_model"] = False
-    pws_configs["tune_end_model"] = False
-    min_contribution = np.min(contribution_matrix.flatten())
-    max_contribution = np.max(contribution_matrix.flatten())
-    def objective(trial):
-        params = {"threshold": trial.suggest_float("threshold", min_contribution, max_contribution)}
+    if tune_threshold:
+        train_dataset = copy.copy(train_dataset)
+        pws_configs = copy.copy(pws_configs)
+        pws_configs["tune_label_model"] = False
+        pws_configs["tune_end_model"] = False
+        if pws_configs["end_model"] in ["bert", "resnet-50"]:
+            # Use fixed feature expression instead of tuning the whole end model
+            pws_configs["end_model"] = "logistic"
+
+        min_contribution = np.min(contribution_matrix.flatten())
+        max_contribution = np.max(contribution_matrix.flatten())
+        def objective(trial):
+            params = {"threshold": trial.suggest_float("threshold", min_contribution, max_contribution)}
+            active_indices = np.max(L_train, axis=1) != -1
+            muted_L_train = copy.copy(L_train)
+            muted_L_train[contribution_matrix < params["threshold"]] = -1
+            revised_active_indices = np.max(muted_L_train, axis=1) != -1
+            if np.sum(revised_active_indices) < 0.1 * np.sum(active_indices):
+                # the number of active instances is too small
+                return -1
+
+            covered_classes = np.unique(muted_L_train)
+            for c in range(train_dataset.n_class):
+                if c not in covered_classes:
+                    # the class is not covered
+                    return -1
+
+            train_dataset.weak_labels = muted_L_train.tolist()
+            try:
+                lf_stats, label_stats, test_perf = run_pws_pipeline(train_dataset, valid_dataset, valid_dataset, **pws_configs)
+            except ValueError:
+                return -1
+
+            if np.isnan(test_perf["acc"]):
+                return -1
+
+            return test_perf["acc"]
+
+
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=100)
         muted_L_train = copy.copy(L_train)
-        muted_L_train[contribution_matrix < params["threshold"]] = -1
-        train_dataset.weak_labels = muted_L_train.tolist()
-        try:
-            lf_stats, label_stats, test_perf = run_pws_pipeline(train_dataset, valid_dataset, valid_dataset, **pws_configs)
-        except ValueError:
-            return -1
-
-        if tune_metric == "acc":
-            return test_perf["acc"]
-        elif tune_metric == "f1":
-            return test_perf["f1"]
-        elif tune_metric == "auc":
-            return test_perf["auc"]
-        else:
-            raise NotImplementedError
-
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=100)
-    muted_L_train = copy.copy(L_train)
-    muted_L_train[contribution_matrix < study.best_params["threshold"]] = -1
-    print(f"Best threshold: {study.best_params['threshold']: .4f}")
-    return muted_L_train
+        muted_L_train[contribution_matrix < study.best_params["threshold"]] = -1
+        return muted_L_train, study.best_params["threshold"]
+    else:
+        threshold = 0.0
+        muted_L_train = copy.copy(L_train)
+        muted_L_train[contribution_matrix < threshold] = -1
+        return muted_L_train, threshold
 
 
 def tune_proxy_model_params(valid_dataset, tune_metric='acc'):
@@ -339,13 +358,13 @@ def compute_if_score(train_data, valid_data,
     return IF_score
 
 
-def tune_if_revision(train_dataset, valid_dataset, if_type, if_mode, pws_configs, tune_metric="acc", if_score=None):
+def run_if_revision(train_dataset, valid_dataset, test_dataset, if_type, if_mode, pws_configs, tune_threshold=True, if_score=None,
+                    device="cuda"):
     """
-    Tune the threshold for IF score revision
+    Run the pipeline of IF revision
     """
     # train label model
     L_train = np.array(train_dataset.weak_labels)
-    train_labels = np.array(train_dataset.labels)
     lf_polarities = np.unique(L_train.reshape(-1))
     if L_train.shape[1] > 3 and len(lf_polarities) >= 3:
         label_model_ = get_wrench_label_model(pws_configs["label_model"], verbose=False)
@@ -355,16 +374,8 @@ def tune_if_revision(train_dataset, valid_dataset, if_type, if_mode, pws_configs
         search_space = None
 
     if search_space is not None and pws_configs["tune_label_model"]:
-        if tune_metric == "f1":
-            if train_dataset.n_class == 2:
-                metric = "f1_binary"
-            else:
-                metric = "f1_micro"
-        else:
-            metric = tune_metric
-
         searched_paras = grid_search(label_model_, dataset_train=train_dataset, dataset_valid=valid_dataset,
-                                     metric=metric, direction='auto',
+                                     metric="acc", direction='auto',
                                      search_space=search_space,
                                      n_repeats=1, n_trials=100, parallel=False)
         label_model_ = get_wrench_label_model(pws_configs["label_model"], **searched_paras, verbose=False)
@@ -381,6 +392,7 @@ def tune_if_revision(train_dataset, valid_dataset, if_type, if_mode, pws_configs
     # run explainer
     explainer = Explainer(train_dataset.n_lf, train_dataset.n_class)
     covered_train_data = train_dataset.get_covered_subset()
+    covered_train_indices = L_train.max(axis=1) >= 0
     L = np.array(covered_train_data.weak_labels)
     xs_tr = np.array(covered_train_data.features)
     aggregated_soft_labels = label_model_.predict_proba(covered_train_data)
@@ -390,45 +402,109 @@ def tune_if_revision(train_dataset, valid_dataset, if_type, if_mode, pws_configs
                                     mode=if_mode, label_model=pws_configs["label_model"],
                                     load_if=False, save_if=False)
 
+    if pws_configs["end_model"] in ["bert", "resnet-50"]:
+        # Use fixed feature expression instead of tuning the whole end model
+        end_model_tuning = "logistic"
+    else:
+        end_model_tuning = pws_configs["end_model"]
+
     def objective(trial):
         params = {"alpha": trial.suggest_float("alpha", 0.7, 1.0)}
         modified_soft_labels = modify_training_labels(aggregated_soft_labels, L, approx_w, if_score, params["alpha"],
                                                       sample_method='weight', normal_if=False, act_func='identity', normalize=True)
-        disc_model = train_disc_model(model_type=pws_configs["end_model"],
+        disc_model = train_disc_model(model_type=end_model_tuning,
                                       distance_metric=pws_configs["distance_metric"],
                                       xs_tr=xs_tr,
                                       ys_tr_soft=modified_soft_labels,
                                       valid_dataset=valid_dataset,
                                       use_soft_labels=pws_configs["use_soft_labels"],
                                       tune_end_model=False,
-                                      tune_metric=tune_metric)
+                                      tune_metric="acc")
 
         valid_perf = evaluate_disc_model(disc_model, valid_dataset)
-        if tune_metric == "acc":
-            return valid_perf["acc"]
-        elif tune_metric == "f1":
-            return valid_perf["f1"]
-        elif tune_metric == "auc":
-            return valid_perf["auc"]
-        else:
-            raise NotImplementedError
+        return valid_perf["acc"]
 
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=100)
-    alpha = study.best_params["alpha"]
-    print("Best alpha: {}".format(alpha))
-    modified_soft_labels = modify_training_labels(aggregated_soft_labels, L, approx_w, if_score, alpha,
-                                                  sample_method='weight', normal_if=False, act_func='identity', normalize=True)
-    disc_model = train_disc_model(model_type=pws_configs["end_model"],
-                                  distance_metric=pws_configs["distance_metric"],
-                                  xs_tr=xs_tr,
-                                  ys_tr_soft=modified_soft_labels,
-                                  valid_dataset=valid_dataset,
-                                  use_soft_labels=pws_configs["use_soft_labels"],
-                                  tune_end_model=pws_configs["tune_end_model"],
-                                  tune_metric=tune_metric)
+    if tune_threshold:
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=100)
+        alpha = study.best_params["alpha"]
+        print("Best alpha: {}".format(alpha))
+        modified_soft_labels = modify_training_labels(aggregated_soft_labels, L, approx_w, if_score, alpha,
+                                                      sample_method='weight', normal_if=False, act_func='identity', normalize=True)
+    else:
+        alpha = 0.9
+        modified_soft_labels = modify_training_labels(aggregated_soft_labels, L, approx_w, if_score, alpha,
+                                                        sample_method='weight', normal_if=False, act_func='identity', normalize=True)
 
-    return modified_soft_labels, disc_model
+    if pws_configs["end_model"] == "bert":
+        # Finetune end model
+        device = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
+        torch.cuda.empty_cache()
+        disc_model = EndClassifierModel(
+            batch_size=32,
+            real_batch_size=16,  # for accumulative gradient update
+            test_batch_size=128,
+            n_steps=1000,
+            backbone='BERT',
+            backbone_model_name='bert-base-cased',
+            backbone_max_tokens=128,
+            backbone_fine_tune_layers=-1,  # fine  tune all
+            optimizer='AdamW',
+            optimizer_lr=5e-5,
+            optimizer_weight_decay=0.0,
+        )
+        disc_model.fit(
+            dataset_train=covered_train_data,
+            y_train=modified_soft_labels,
+            dataset_valid=valid_dataset,
+            evaluation_step=10,
+            metric='acc',
+            patience=10,
+            device=device
+        )
+        test_perf = evaluate_disc_model(disc_model, test_dataset)
+
+    elif pws_configs["end_model"] == "resnet-50":
+        # Load the pre-trained ResNet-50 model
+        disc_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        # Modify the final layer to match the number of classes in your dataset
+        num_classes = train_dataset.n_class
+        disc_model.fc = nn.Linear(disc_model.fc.in_features, num_classes)
+        modified_hard_labels = random_argmax(modified_soft_labels)
+
+        train_dataset_ = FeaturesDataset(train_dataset.images[covered_train_indices], modified_hard_labels)
+        valid_dataset_ = FeaturesDataset(valid_dataset.images, valid_dataset.labels)
+        test_dataset_ = FeaturesDataset(test_dataset.images, test_dataset.labels)
+        train_loader = DataLoader(train_dataset_, batch_size=64, shuffle=True)
+        valid_loader = DataLoader(valid_dataset_, batch_size=64, shuffle=False)
+        test_loader = DataLoader(test_dataset_, batch_size=64, shuffle=False)
+        # Train the resnet-50 model
+        device = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
+        torch.cuda.empty_cache()
+        disc_model = train_resnet(disc_model, train_loader, valid_loader,
+                                  n_epochs=50, lr=1e-4, weight_decay=1e-5, device=device)
+        test_perf = evaluate_resnet(disc_model, test_loader, device)
+
+    else:
+        disc_model = train_disc_model(model_type=pws_configs["end_model"],
+                                      distance_metric=pws_configs["distance_metric"],
+                                      xs_tr=xs_tr,
+                                      ys_tr_soft=modified_soft_labels,
+                                      valid_dataset=valid_dataset,
+                                      use_soft_labels=pws_configs["use_soft_labels"],
+                                      tune_end_model=pws_configs["tune_end_model"],
+                                      tune_metric="acc")
+        test_perf = evaluate_disc_model(disc_model, test_dataset)
+
+    cur_L_train = np.array(train_dataset.weak_labels)
+    train_labels = np.array(train_dataset.labels)
+    revised_lf_stats = evaluate_lfs(train_labels, cur_L_train, n_class=train_dataset.n_class)
+    ys_tr = np.repeat(-1, len(train_labels))
+    covered_train_indices = np.max(cur_L_train, axis=1) >= 0
+    ys_tr[covered_train_indices] = np.argmax(modified_soft_labels, axis=1)
+    revised_label_stats = evaluate_labels(train_labels, ys_tr, n_class=train_dataset.n_class)
+
+    return revised_lf_stats, revised_label_stats, test_perf, alpha
 
 
 def print_dataset_stats(dataset, split="train"):
@@ -438,15 +514,9 @@ def print_dataset_stats(dataset, split="train"):
     print("Label distribution: ", freq)
 
 
-def save_lfs(lfs, path):
-    with open(path, "w") as f:
-        for lf in lfs:
-            f.write(lf.info() + "\n")
-
-
 def run_pws_pipeline(train_dataset, valid_dataset, test_dataset, label_model, end_model,
                      tune_label_model=False, tune_end_model=False, tune_metric="acc", abstain_strategy="discard",
-                     distance_metric="euclidean", use_soft_labels=True, return_models=False):
+                     distance_metric="euclidean", use_soft_labels=True, device="cuda"):
     """
     Run the pipeline of PWS
     """
@@ -497,41 +567,94 @@ def run_pws_pipeline(train_dataset, valid_dataset, test_dataset, label_model, en
         # discard non-abstain indices
         xs_tr = train_dataset.features[train_covered_indices, :]
         ys_tr_soft = ys_tr_soft[train_covered_indices, :]
-
     elif abstain_strategy == "keep":
         # keep the predictions for abstain indices
         xs_tr = train_dataset.features
-
     elif abstain_strategy == "random":
         # randomly assign labels to abstain indices
         xs_tr = train_dataset.features
         ys_tr_soft[~train_covered_indices, :] = 1 / train_dataset.n_class
-
     else:
         raise ValueError("Invalid abstain strategy: {}".format(abstain_strategy))
 
-    disc_model = train_disc_model(model_type=end_model,
-                                  distance_metric=distance_metric,
-                                  xs_tr=xs_tr,
-                                  ys_tr_soft=ys_tr_soft,
-                                  valid_dataset=valid_dataset,
-                                  use_soft_labels=use_soft_labels,
-                                  tune_end_model=tune_end_model,
-                                  tune_metric=tune_metric)
-
-    if disc_model is not None:
+    if end_model  in ["knn", "logistic", "mlp"]:
+        # Use fixed feature expression, no need to tune end model
+        disc_model = train_disc_model(model_type=end_model,
+                                      distance_metric=distance_metric,
+                                      xs_tr=xs_tr,
+                                      ys_tr_soft=ys_tr_soft,
+                                      valid_dataset=valid_dataset,
+                                      use_soft_labels=use_soft_labels,
+                                      tune_end_model=tune_end_model,
+                                      tune_metric=tune_metric)
         test_perf = evaluate_disc_model(disc_model, test_dataset)
-    else:
-        test_perf = {
-            "acc": np.nan,
-            "f1": np.nan,
-            "auc": np.nan,
-        }
 
-    if return_models:
-        return lf_train_stats, train_label_stats, test_perf, label_model_, disc_model
+    elif end_model == "bert":
+        # Finetune end model
+        if abstain_strategy == "discard":
+            indices = [i for i in range(len(train_covered_indices)) if train_covered_indices[i]]
+            downstream_train_dataset = train_dataset.create_subset(indices)
+        else:
+            downstream_train_dataset = train_dataset
+
+        device = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
+        torch.cuda.empty_cache()
+        disc_model = EndClassifierModel(
+            batch_size=32,
+            real_batch_size=16,  # for accumulative gradient update
+            test_batch_size=128,
+            n_steps=1000,
+            backbone='BERT',
+            backbone_model_name='bert-base-cased',
+            backbone_max_tokens=128,
+            backbone_fine_tune_layers=-1,  # fine  tune all
+            optimizer='AdamW',
+            optimizer_lr=5e-5,
+            optimizer_weight_decay=0.0,
+        )
+        disc_model.fit(
+            dataset_train=downstream_train_dataset,
+            y_train=ys_tr_soft,
+            dataset_valid=valid_dataset,
+            evaluation_step=10,
+            metric='acc',
+            patience=10,
+            device=device
+        )
+        test_perf = evaluate_disc_model(disc_model, test_dataset)
+
+    elif end_model == "resnet-50":
+        # Load the pre-trained ResNet-50 model
+        disc_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+
+        # Modify the final layer to match the number of classes in your dataset
+        num_classes = train_dataset.n_class  # Change this to the number of classes in your dataset
+        disc_model.fc = nn.Linear(disc_model.fc.in_features, num_classes)
+
+        # Create datasets in the format compatible of resnet-50 model
+        if abstain_strategy == "discard":
+            ys_tr = random_argmax(ys_tr_soft)
+            train_dataset_ = FeaturesDataset(train_dataset.images[train_covered_indices], ys_tr)
+        else:
+            train_dataset_ = FeaturesDataset(train_dataset.images, ys_tr)
+
+        valid_dataset_ = FeaturesDataset(valid_dataset.images, valid_dataset.labels)
+        test_dataset_ = FeaturesDataset(test_dataset.images, test_dataset.labels)
+        train_loader = DataLoader(train_dataset_, batch_size=64, shuffle=True)
+        valid_loader = DataLoader(valid_dataset_, batch_size=64, shuffle=False)
+        test_loader = DataLoader(test_dataset_, batch_size=64, shuffle=False)
+
+        # Train the resnet-50 model
+        device = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
+        torch.cuda.empty_cache()
+        disc_model = train_resnet(disc_model, train_loader, valid_loader,
+                                  n_epochs=50, lr=1e-4, weight_decay=1e-5, device=device)
+        test_perf = evaluate_resnet(disc_model, test_loader, device)
+
     else:
-        return lf_train_stats, train_label_stats, test_perf
+        raise ValueError(f"Unsupported end model: {end_model}")
+
+    return lf_train_stats, train_label_stats, test_perf
 
 
 
